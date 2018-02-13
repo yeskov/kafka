@@ -23,12 +23,7 @@ import org.apache.kafka.clients.NetworkClient;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.consumer.OffsetCommitCallback;
-import org.apache.kafka.clients.producer.internals.ProducerInterceptors;
-import org.apache.kafka.clients.producer.internals.ProducerMetrics;
-import org.apache.kafka.clients.producer.internals.RecordAccumulator;
-import org.apache.kafka.clients.producer.internals.Sender;
-import org.apache.kafka.clients.producer.internals.TransactionManager;
-import org.apache.kafka.clients.producer.internals.TransactionalRequestResult;
+import org.apache.kafka.clients.producer.internals.*;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.Metric;
@@ -66,11 +61,7 @@ import org.apache.kafka.common.utils.Time;
 import org.slf4j.Logger;
 
 import java.net.InetSocketAddress;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Properties;
+import java.util.*;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
@@ -758,6 +749,126 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         // intercept the record, which can be potentially modified; this method does not throw exceptions
         ProducerRecord<K, V> interceptedRecord = this.interceptors == null ? record : this.interceptors.onSend(record);
         return doSend(interceptedRecord, callback);
+    }
+
+    @Override
+    public List<Future<RecordMetadata>> sendBatch(String topic, byte[] partitionKey, List<ProducerRecord<K, V>> producerRecords) {
+        List<ProducerRecord<K, V>> interceptedRecords;
+        if (this.interceptors != null) {
+            interceptedRecords = new ArrayList<>();
+            for (ProducerRecord<K, V> record : producerRecords) {
+                interceptedRecords.add(this.interceptors.onSend(record));
+            }
+        } else {
+            interceptedRecords = producerRecords;
+        }
+        return doSendBatch(topic, partitionKey, interceptedRecords);
+    }
+
+
+    /**
+     * Implementation of asynchronously send a record to a topic.
+     */
+    private List<Future<RecordMetadata>> doSendBatch(String topic, byte[] partitionKey, List<ProducerRecord<K, V>> recordList) {
+        TopicPartition tp = null;
+        try {
+            // first make sure the metadata for the topic is available
+            ClusterAndWaitTime clusterAndWaitTime = waitOnMetadata(topic, null, maxBlockTimeMs);
+            long remainingWaitMs = Math.max(0, maxBlockTimeMs - clusterAndWaitTime.waitedOnMetadataMs);
+            Cluster cluster = clusterAndWaitTime.cluster;
+
+            int partition =   partitioner.partition(topic, partitionKey, partitionKey, null, null, cluster); //TODO: meskov: ugly
+
+            tp = new TopicPartition(topic, partition);
+
+
+            List<RawProducedRecord> producedRecordsRaw = new ArrayList<>();
+            for (ProducerRecord<K,V> record : recordList) {
+                byte[] serializedKey;
+                try {
+                    serializedKey = keySerializer.serialize(topic, record.headers(), record.key());
+                } catch (ClassCastException cce) {
+                    throw new SerializationException("Can't convert key of class " + record.key().getClass().getName() +
+                            " to class " + producerConfig.getClass(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG).getName() +
+                            " specified in key.serializer", cce);
+                }
+                byte[] serializedValue;
+                try {
+                    serializedValue = valueSerializer.serialize(record.topic(), record.headers(), record.value());
+                } catch (ClassCastException cce) {
+                    throw new SerializationException("Can't convert value of class " + record.value().getClass().getName() +
+                            " to class " + producerConfig.getClass(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG).getName() +
+                            " specified in value.serializer", cce);
+                }
+
+                setReadOnly(record.headers());
+                Header[] headers = record.headers().toArray();
+
+                int serializedSize = AbstractRecords.estimateSizeInBytesUpperBound(apiVersions.maxUsableProduceMagic(),
+                        compressionType, serializedKey, serializedValue, headers);
+                ensureValidRecordSize(serializedSize);
+
+                producedRecordsRaw.add(new RawProducedRecord(serializedKey, serializedValue, headers));
+
+                log.trace("Sending record {} with callback {} to topic {} partition {}", record, null, record.topic(), partition);
+
+            }
+
+            //TODO: meskov: resolve timestamp
+            long timestamp = time.milliseconds();
+
+            // producer callback will make sure to call both 'callback' and interceptor callback
+            Callback interceptCallback = new InterceptorCallback<>(null, this.interceptors, tp);
+
+            if (transactionManager != null && transactionManager.isTransactional())
+                transactionManager.maybeAddPartitionToTransaction(tp);
+
+            List<Future<RecordMetadata>> result = (List)accumulator.appendBatch(tp, timestamp, producedRecordsRaw, remainingWaitMs);
+
+            log.trace("Waking up the sender since topic {} partition {} is either full or getting a new batch", tp.topic(), partition);
+            this.sender.wakeup();
+
+            return result;
+        } catch (ApiException e) { //TODO: Errors in batch must continue batch processing
+            log.debug("Exception occurred during message send:", e);
+            this.errors.record();
+            notifyAllInterceptors(recordList, tp, e);
+            return errorFutures(recordList.size(), e);
+        } catch (InterruptedException e) {
+            this.errors.record();
+            notifyAllInterceptors(recordList, tp, e);
+            throw new InterruptException(e);
+        } catch (BufferExhaustedException e) {
+            this.errors.record();
+            this.metrics.sensor("buffer-exhausted-records").record();
+            notifyAllInterceptors(recordList, tp, e);
+            throw e;
+        } catch (KafkaException e) {
+            this.errors.record();
+            notifyAllInterceptors(recordList, tp, e);
+            throw e;
+        } catch (Exception e) {
+            // we notify interceptor about all exceptions, since onSend is called before anything else in this method
+            notifyAllInterceptors(recordList, tp, e);
+            throw e;
+        }
+    }
+
+    private void notifyAllInterceptors(List<ProducerRecord<K, V>> recordList, TopicPartition tp, Exception e) {
+        //TODO: meskov: errors from one send can't go to another interceptor.
+        if (interceptors != null) {
+            for (ProducerRecord<K,V> record : recordList) {
+                interceptors.onSendError(record, tp, e);
+            }
+        }
+    }
+
+    private List<Future<RecordMetadata>> errorFutures(int size, Exception e){
+        ArrayList<Future<RecordMetadata>> errorFutures = new ArrayList<>();
+        for (int i=0 ; i< size; i++) {
+            errorFutures.add(new FutureFailure(e));
+        }
+        return errorFutures;
     }
 
     /**

@@ -24,6 +24,7 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.ProducerFencedException;
 
 import java.io.Closeable;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Future;
@@ -71,6 +72,8 @@ public interface Producer<K, V> extends Closeable {
      * See {@link KafkaProducer#send(ProducerRecord, Callback)}
      */
     Future<RecordMetadata> send(ProducerRecord<K, V> record, Callback callback);
+
+    List<Future<RecordMetadata>> sendBatch(String topic, byte[] partitionKey, List<ProducerRecord<K, V>> records);
 
     /**
      * See {@link KafkaProducer#flush()}

@@ -236,6 +236,16 @@ public class MockProducer<K, V> implements Producer<K, V> {
         return send(record, null);
     }
 
+
+    @Override
+    public synchronized List<Future<RecordMetadata>> sendBatch(String topic, byte[] partitionKey, List<ProducerRecord<K, V>> producerRecords) {
+        ArrayList<Future<RecordMetadata>> result = new ArrayList<>();
+        for (ProducerRecord<K,V> record : producerRecords) {
+            result.add(send(record));
+        }
+        return result;
+    }
+
     /**
      * Adds the record to the list of sent records.
      *

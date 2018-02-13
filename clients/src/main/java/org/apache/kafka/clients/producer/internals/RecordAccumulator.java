@@ -164,6 +164,87 @@ public final class RecordAccumulator {
         bufferExhaustedRecordSensor.add(new Meter(rateMetricName, totalMetricName));
     }
 
+    public List<FutureRecordMetadata> appendBatch(TopicPartition tp,
+                                                long timestamp,
+                                                List<RawProducedRecord> recordList,
+                                                long maxTimeToBlock) throws InterruptedException {
+        // We keep track of the number of appending thread to make sure we do not miss batches in
+        // abortIncompleteBatches().
+        appendsInProgress.incrementAndGet();
+        List<FutureRecordMetadata> result  = new ArrayList<>();
+        try {
+            // check if we have an in-progress batch
+            Deque<ProducerBatch> dq = getOrCreateDeque(tp);
+            synchronized (dq) {
+                if (closed)
+                    throw new IllegalStateException("Cannot send after the producer is closed.");
+
+                ProducerBatch current = dq.peekLast();
+                if (current != null) {
+                    if (!current.isFull()) {
+                        log.info("Has not full batch for {}. Seems like client is mixing batched and not batched send mode on this topic. This can lead to suboptimal latency.");
+                    } else {
+                        current = null;
+                    }
+                }
+
+                int index = 0;
+                boolean freshBatch;
+                do  {
+                    RawProducedRecord record = recordList.get(index);
+                    if (current == null) {
+                        // we don't have an in-progress record batch try to allocate a new batch
+                        byte maxUsableMagic = apiVersions.maxUsableProduceMagic();
+                        int size = Math.max(this.batchSize, AbstractRecords.estimateSizeInBytesUpperBound(maxUsableMagic, compression, record.getKey(), record.getValue(), record.getHeaders()));
+                        log.trace("Allocating a new {} byte message buffer for topic {} partition {}", size, tp.topic(), tp.partition());
+                        ByteBuffer buffer = free.allocate(size, maxTimeToBlock); //TODO: meskov: leave buffer allocation under lock for now
+
+                        try {
+                            MemoryRecordsBuilder recordsBuilder = recordsBuilder(buffer, maxUsableMagic); //TODO: batch exceptions handling
+                            current = new ProducerBatch(tp, recordsBuilder, time.milliseconds());
+                        } catch (Exception e) {
+                            free.deallocate(buffer);
+                            throw e;
+                        }
+
+                        dq.addLast(current);
+                        incomplete.add(current);
+                        freshBatch = true;
+                    } else {
+                        freshBatch = false;
+                    }
+
+
+                    FutureRecordMetadata future = current.tryAppend(timestamp, record.getKey(), record.getValue(), record.getHeaders(), null, time.milliseconds());
+
+                    if (future == null) {
+                        if (freshBatch) {
+                            throw new IllegalStateException("Fresh bath must take one record!");
+                        } else {
+                            log.info("Batch send for {} is to large. Will be be split into several batches", tp);
+                            current.closeForRecordAppends();
+                            current = null;
+                        }
+                    } else {
+                        result.add(future);
+                        index++;
+                    }
+
+                } while (index < recordList.size());
+
+
+                if (current != null) {
+                    current.closeForRecordAppends();
+                }
+            }
+
+        } finally {
+            appendsInProgress.decrementAndGet();
+        }
+
+        return result;
+    }
+
     /**
      * Add a record to the accumulator, return the append result
      * <p>
