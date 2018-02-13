@@ -1,5 +1,20 @@
+
+Fork Info
+=================
+
+Draft version of  kafka client  with support of sending batch of messages. 
+
+Will improve latency in already batched environment because driver will not split batch into several requests.  With careful setting of  max.request.size and batch.size You can achieve single network request per batch without interfering of other batches.
+This improvement is intended for situations when you have already batched environment and whole batch execution latency is crucial. 
+
+Version is draft (for performance testing), **not production ready**.
+
+Need to support exceptional situations more carefully.
+
+
 Apache Kafka
 =================
+
 See our [web site](http://kafka.apache.org) for details on the project.
 
 You need to have [Gradle](http://www.gradle.org/installation) and [Java](http://www.oracle.com/technetwork/java/javase/downloads/index.html) installed.
